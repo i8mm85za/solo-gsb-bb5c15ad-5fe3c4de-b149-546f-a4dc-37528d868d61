@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from datetime import datetime
+from decimal import Decimal
 from typing import List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Response
@@ -541,10 +542,10 @@ def get_comparison(
     metric: str = Query(min_length=1, description="指标名，如 temperature"),
     from_: datetime = Query(alias="from", description="UTC 时间段起点（含），ISO 8601"),
     to: datetime = Query(description="UTC 时间段终点（不含），ISO 8601"),
-    max_time_delta_seconds: float = Query(
+    max_time_delta_seconds: Decimal = Query(
         ge=0, description="允许的最大时间偏差（秒）；时间差不超过该值才允许配对"
     ),
-    allowed_value_diff: float = Query(
+    allowed_value_diff: Decimal = Query(
         ge=0, description="允许的读数绝对数值偏差；严格大于该值标记为超差"
     ),
 ):

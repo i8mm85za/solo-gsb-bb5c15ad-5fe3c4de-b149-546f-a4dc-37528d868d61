@@ -15,6 +15,15 @@
 配对（保序二分匹配，每条测量最多参与一次）：
 - 仅当两侧单位相同（unit 均为 null 视为相同；仅一侧缺失视为不同）且
   有效时间差绝对值不超过 max_time_delta 时允许配对；
+- 时间资格判定：有效时间差按整数微秒计（datetime 本身精度即微秒），
+  与请求阈值的十进制表示（Decimal）直接比较，绝不把阈值"四舍五入"成
+  微秒整数而扩大上限——例如阈值 0.0000015 秒（1.5μs）时，相差 2μs 的
+  两侧不可配对，相差 1μs 才允许；阈值 0.000002 秒（恰 2μs）时，相差
+  2μs 仍按"不超过上限"合格；
+- 读数差与超差判定：读数按存储的十进制表示（Decimal）解析，绝对差与
+  请求 allowed_value_diff 的十进制表示比较，规避二进制浮点相减误差
+  （如 20.0 与 21.6 的差恰为 1.6）；绝对差等于上限视为合格，仅严格
+  大于上限才标记超差；
 - 优化目标依次为：① 最大化配对数；② 最小化全部配对的时间差总和；
   ③ 仍平局时，按排序后的配对序号序列 ((ref_idx, target_idx), ...)
   字典序最小决胜，保证结果唯一确定；
@@ -27,6 +36,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import List, NamedTuple, Optional, Tuple
 
 from .schemas import ComparisonPair, ComparisonResponse, ComparisonSidePoint
@@ -54,7 +64,7 @@ class _Point:
     position: int
     time: datetime
     time_source: str  # "ts" / "sent_at"
-    value: float
+    value: Decimal  # 按存储的十进制读数解析，避免二进制浮点误差
     unit: Optional[str]
 
 
@@ -87,6 +97,10 @@ def load_points(
     """读取一台设备在 [from, to) 内的同指标候选测量，按时间序排序。
 
     仅扫描已提交包；测量时间优先取 ts、否则取包 sent_at，均无则忽略。
+
+    payload 用 parse_float=Decimal 解析：读数按其在 JSON 中存储的十进制
+    表示保留（21.6 即 Decimal("21.6")），后续绝对差与超差判定不经过
+    二进制浮点，避免 20.0 与 21.6 相减得到 1.6000000000000014 之类误差。
     """
     points: List[_Point] = []
     rows = conn.execute(
@@ -94,7 +108,7 @@ def load_points(
         (device_id,),
     ).fetchall()
     for row in rows:
-        payload = json.loads(row["payload_json"])
+        payload = json.loads(row["payload_json"], parse_float=Decimal)
         raw_sent_at = payload.get("sent_at")
         sent_at = _parse_time(raw_sent_at) if raw_sent_at else None
         for position, measurement in enumerate(payload.get("measurements", [])):
@@ -110,13 +124,15 @@ def load_points(
             else:
                 continue  # 无 ts 且包无 sent_at：忽略
             if from_ <= time < to:
+                raw_value = measurement["value"]
                 points.append(
                     _Point(
                         seq=row["seq"],
                         position=position,
                         time=time,
                         time_source=time_source,
-                        value=float(measurement["value"]),
+                        value=raw_value if isinstance(raw_value, Decimal)
+                        else Decimal(raw_value),
                         unit=measurement.get("unit"),
                     )
                 )
@@ -132,6 +148,17 @@ def _delta_us(a: _Point, b: _Point) -> int:
     return (delta.days * 86400 + delta.seconds) * _US_PER_SECOND + delta.microseconds
 
 
+def _within_time_delta(delta_us: int, max_delta_seconds: Decimal) -> bool:
+    """整数微秒时间差是否不超过请求阈值（按阈值的十进制表示直接比较）。
+
+    delta_us 是时间差的整数微秒数（datetime 精度即微秒）；阈值是请求里的
+    十进制秒数。把整数微秒差换算成十进制秒后与阈值比较，不做任何
+    "四舍五入到微秒"的处理，因而不会扩大上限：
+    阈值 1.5μs 时，2μs（0.000002 > 0.0000015）不合格，1μs 合格。
+    """
+    return Decimal(delta_us) <= max_delta_seconds * _US_PER_SECOND
+
+
 def _better(x: _State, y: _State) -> bool:
     """配对数多者优；其次时间差总和小者；再其次配对序号序列字典序小者。"""
     return (-x.pairs, x.cost_us, x.code) < (-y.pairs, y.cost_us, y.code)
@@ -140,7 +167,7 @@ def _better(x: _State, y: _State) -> bool:
 def match_points(
     ref: List[_Point],
     target: List[_Point],
-    max_delta_us: int,
+    max_delta_seconds: Decimal,
 ) -> List[Tuple[int, int]]:
     """保序二分匹配主过程，返回排序后的 (ref_idx, target_idx) 配对列表。
 
@@ -171,7 +198,7 @@ def match_points(
             b = target[j - 1]
             if a.unit == b.unit:  # None == None 视为单位相同；仅一侧缺失则不同
                 delta_us = _delta_us(a, b)
-                if delta_us <= max_delta_us:
+                if _within_time_delta(delta_us, max_delta_seconds):
                     p = prev[j - 1]
                     matched = _State(
                         p.pairs + 1,
@@ -208,7 +235,7 @@ def _side_point(device_id: str, p: _Point) -> ComparisonSidePoint:
         position=p.position,
         time=p.time,
         time_source=p.time_source,
-        value=p.value,
+        value=float(p.value),
         unit=p.unit,
     )
 
@@ -220,10 +247,15 @@ def compare_devices(
     metric: str,
     from_: datetime,
     to: datetime,
-    max_time_delta_seconds: float,
-    allowed_value_diff: float,
+    max_time_delta_seconds: Decimal,
+    allowed_value_diff: Decimal,
 ) -> ComparisonResponse:
-    """执行双设备同指标并行比对。调用方需保证两台设备均存在。"""
+    """执行双设备同指标并行比对。调用方需保证两台设备均存在。
+
+    两个阈值均为请求参数的十进制表示（Decimal）：时间资格按整数微秒差
+    与该十进制值直接比较（不扩大上限），读数超差按存储的十进制读数差
+    与之比较（等于上限合格）。
+    """
     from_ = _as_utc(from_)
     to = _as_utc(to)
     if reference_device == target_device:
@@ -234,8 +266,6 @@ def compare_devices(
         raise ComparisonError("max_time_delta_seconds 不能为负数")
     if allowed_value_diff < 0:
         raise ComparisonError("allowed_value_diff 不能为负数")
-
-    max_delta_us = round(max_time_delta_seconds * _US_PER_SECOND)
 
     ref_points = load_points(conn, reference_device, metric, from_, to)
     if len(ref_points) > MAX_SIDE_POINTS:
@@ -254,7 +284,7 @@ def compare_devices(
             "（服务端不截断）"
         )
 
-    matched = match_points(ref_points, target_points, max_delta_us)
+    matched = match_points(ref_points, target_points, max_time_delta_seconds)
 
     pairs: List[ComparisonPair] = []
     exceeded_count = 0
@@ -262,7 +292,7 @@ def compare_devices(
         a = ref_points[ref_idx]
         b = target_points[target_idx]
         delta_us = _delta_us(a, b)
-        abs_diff = abs(a.value - b.value)
+        abs_diff = abs(a.value - b.value)  # 存储的十进制读数之差，不经二进制浮点
         exceeded = abs_diff > allowed_value_diff  # 等于允许偏差不算超差
         exceeded_count += int(exceeded)
         pairs.append(
@@ -271,7 +301,7 @@ def compare_devices(
                 reference=_side_point(reference_device, a),
                 target=_side_point(target_device, b),
                 time_delta_seconds=delta_us / _US_PER_SECOND,
-                abs_value_diff=abs_diff,
+                abs_value_diff=float(abs_diff),
                 exceeded=exceeded,
             )
         )

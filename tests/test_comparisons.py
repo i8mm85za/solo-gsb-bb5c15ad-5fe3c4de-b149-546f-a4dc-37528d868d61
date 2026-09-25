@@ -112,6 +112,32 @@ def test_exceeded_is_strict_greater_than_allowed_diff(client):
     assert sorted(p["exceeded"] for p in body["pairs"]) == [False, True]
 
 
+def test_value_diff_boundary_decimal_exact(client):
+    # 回归：读数 20.0 与 21.6 的绝对差恰为 1.6。
+    # 二进制浮点相减会得到 1.6000000000000014，旧实现据此误报超差；
+    # 应按存储的十进制读数与阈值的十进制表示判定：
+    # allowed_value_diff=1.6（等于上限）合格，1.5 才超差。
+    client.post("/api/v1/packages", json=pkg(
+        "ref", 1, "1", [m(20.0, ts="2026-09-23T08:00:00Z")]))
+    client.post("/api/v1/packages", json=pkg(
+        "tgt", 1, "1", [m(21.6, ts="2026-09-23T08:00:00Z")]))
+
+    body = compare(client, max_time_delta_seconds=0,
+                   allowed_value_diff="1.6").json()
+    assert body["paired_count"] == 1
+    pair = body["pairs"][0]
+    assert pair["abs_value_diff"] == pytest.approx(1.6)
+    assert pair["exceeded"] is False
+    assert body["exceeded_count"] == 0
+
+    # 上限小一档（1.5）：绝对差严格大于上限，超差
+    body = compare(client, max_time_delta_seconds=0,
+                   allowed_value_diff="1.5").json()
+    pair = body["pairs"][0]
+    assert pair["exceeded"] is True
+    assert body["exceeded_count"] == 1
+
+
 def test_unpaired_counts(client):
     client.post("/api/v1/packages", json=pkg(
         "ref", 1, "1", [m(20.0, ts="2026-09-23T08:00:10Z")]))
@@ -232,6 +258,40 @@ def test_max_time_delta_boundary_inclusive(client):
         "tgt", 1, "1", [m(10.0, ts="2026-09-23T08:00:05Z")]))
     assert compare(client, max_time_delta_seconds=5).json()["paired_count"] == 1
     assert compare(client, max_time_delta_seconds=4).json()["paired_count"] == 0
+
+
+def test_submicrosecond_delta_not_rounded_up(client):
+    # 回归：阈值 0.0000015 秒（1.5μs）。
+    # 两侧相差 2μs 时不得把阈值四舍五入扩大成 2μs 而错误配对；
+    # 相差 1μs（未超阈值）应配对；阈值恰为 0.000002 秒时相差 2μs
+    # 仍属"不超过上限"，应配对（上限不缩小、不扩大）。
+    client.post("/api/v1/packages", json=pkg(
+        "ref", 1, "1", [m(10.0, ts="2026-09-23T08:00:00.000000Z")]))
+    client.post("/api/v1/packages", json=pkg(
+        "tgt", 1, "1", [m(10.0, ts="2026-09-23T08:00:00.000002Z")]))
+
+    # 字符串形式传入，避免客户端 float 表示干扰阈值的十进制取值
+    body = compare(client, max_time_delta_seconds="0.0000015").json()
+    assert body["paired_count"] == 0
+    assert body["reference_unpaired_count"] == 1
+    assert body["target_unpaired_count"] == 1
+
+    # 同一份数据，阈值放宽到 2μs：恰好等于上限，配对成功
+    body = compare(client, max_time_delta_seconds="0.000002").json()
+    assert body["paired_count"] == 1
+    assert body["pairs"][0]["time_delta_seconds"] == pytest.approx(0.000002)
+
+    # 再补一个相差 1μs 的测量对：1.5μs 阈值下可配对
+    client.post("/api/v1/packages", json=pkg(
+        "ref", 2, "2", [m(10.0, ts="2026-09-23T08:10:00.000000Z")]))
+    client.post("/api/v1/packages", json=pkg(
+        "tgt", 2, "2", [m(10.0, ts="2026-09-23T08:10:00.000001Z")]))
+    body = compare(client, max_time_delta_seconds="0.0000015").json()
+    assert body["reference_count"] == 2 and body["target_count"] == 2
+    assert body["paired_count"] == 1
+    pair = body["pairs"][0]
+    assert pair["reference"]["seq"] == 2 and pair["target"]["seq"] == 2
+    assert pair["time_delta_seconds"] == pytest.approx(0.000001)
 
 
 def test_naive_datetimes_treated_as_utc(client):
