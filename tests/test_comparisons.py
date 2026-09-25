@@ -245,6 +245,60 @@ def test_naive_datetimes_treated_as_utc(client):
 
 
 # ---------------------------------------------------------------------------
+# 边界回归：小数微秒时间阈值不取整、读数差按十进制计算
+# ---------------------------------------------------------------------------
+
+def test_fractional_microsecond_time_threshold_not_rounded_up(client):
+    # 两侧测量时间相差 2 微秒；阈值 1.5 微秒不得被舍入扩大为 2 微秒
+    client.post("/api/v1/packages", json=pkg(
+        "ref", 1, "1", [m(10.0, ts="2026-09-23T08:00:00.000000Z")]))
+    client.post("/api/v1/packages", json=pkg(
+        "tgt", 1, "1", [m(10.0, ts="2026-09-23T08:00:00.000002Z")]))
+    body = compare(client, max_time_delta_seconds=0.0000015).json()
+    assert body["paired_count"] == 0
+    assert body["reference_unpaired_count"] == 1
+    assert body["target_unpaired_count"] == 1
+    # 阈值不足 2 微秒（1.9 微秒）同样不可配对
+    assert compare(client, max_time_delta_seconds=0.0000019
+                   ).json()["paired_count"] == 0
+    # 阈值恰好 2 微秒：等于上限，允许配对（边界含）
+    body = compare(client, max_time_delta_seconds=0.000002).json()
+    assert body["paired_count"] == 1
+    assert body["pairs"][0]["time_delta_seconds"] == pytest.approx(0.000002)
+
+
+def test_value_diff_decimal_boundary_not_exceeded(client):
+    # 20.0 与 21.6 的二进制浮点差为 1.6000000000000014；
+    # 按存储的十进制读数计算恰为 1.6，等于允许偏差，不超差
+    client.post("/api/v1/packages", json=pkg(
+        "ref", 1, "1", [m(20.0, ts="2026-09-23T08:00:10Z")]))
+    client.post("/api/v1/packages", json=pkg(
+        "tgt", 1, "1", [m(21.6, ts="2026-09-23T08:00:10Z")]))
+    body = compare(client, allowed_value_diff=1.6).json()
+    assert body["paired_count"] == 1
+    pair = body["pairs"][0]
+    assert pair["abs_value_diff"] == pytest.approx(1.6)
+    assert pair["exceeded"] is False
+    assert body["exceeded_count"] == 0
+    # 允许偏差收紧到 1.5：十进制差 1.6 严格大于它，超差
+    body = compare(client, allowed_value_diff=1.5).json()
+    assert body["pairs"][0]["exceeded"] is True
+    assert body["exceeded_count"] == 1
+
+
+def test_value_diff_strictly_greater_in_decimal_is_exceeded(client):
+    # 十进制差 1.7 严格大于允许偏差 1.6：超差判定仍然生效
+    client.post("/api/v1/packages", json=pkg(
+        "ref", 1, "1", [m(20.0, ts="2026-09-23T08:00:10Z")]))
+    client.post("/api/v1/packages", json=pkg(
+        "tgt", 1, "1", [m(21.7, ts="2026-09-23T08:00:10Z")]))
+    body = compare(client, allowed_value_diff=1.6).json()
+    assert body["pairs"][0]["abs_value_diff"] == pytest.approx(1.7)
+    assert body["pairs"][0]["exceeded"] is True
+    assert body["exceeded_count"] == 1
+
+
+# ---------------------------------------------------------------------------
 # 单位
 # ---------------------------------------------------------------------------
 

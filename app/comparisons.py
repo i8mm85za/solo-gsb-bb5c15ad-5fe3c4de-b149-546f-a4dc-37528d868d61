@@ -14,19 +14,26 @@
 
 配对（保序二分匹配，每条测量最多参与一次）：
 - 仅当两侧单位相同（unit 均为 null 视为相同；仅一侧缺失视为不同）且
-  有效时间差绝对值不超过 max_time_delta 时允许配对；
+  有效时间差绝对值不超过 max_time_delta 时允许配对；时间差为整数微秒，
+  与请求阈值的十进制表示直接比较（如 1.5 微秒的上限就是 1.5，绝不
+  四舍五入扩大为 2 微秒）；
 - 优化目标依次为：① 最大化配对数；② 最小化全部配对的时间差总和；
   ③ 仍平局时，按排序后的配对序号序列 ((ref_idx, target_idx), ...)
   字典序最小决胜，保证结果唯一确定；
 - 序列对齐式动态规划在 O(nm) 时间、O(nm) 字节回溯表内求得最优解，
   状态转移只允许"跳过参考点 / 跳过待检点 / 对角配对"，天然保持两侧
   时间顺序、禁止交叉配对。
+
+已配对读数的绝对差与超差判定同样按存储的十进制读数与请求阈值的十进制
+表示计算（如 21.6 - 20.0 恰为 1.6），等于允许偏差视为合格，避免二进制
+浮点相减的尾数误差把边界误判为超差。
 """
 
 import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import List, NamedTuple, Optional, Tuple
 
 from .schemas import ComparisonPair, ComparisonResponse, ComparisonSidePoint
@@ -132,6 +139,15 @@ def _delta_us(a: _Point, b: _Point) -> int:
     return (delta.days * 86400 + delta.seconds) * _US_PER_SECOND + delta.microseconds
 
 
+def _decimal(x: float) -> Decimal:
+    """按浮点数的十进制表示构造 Decimal，规避二进制浮点尾数误差。
+
+    str(float) 给出能精确回读该浮点的最短十进制串，与请求参数 / 存储
+    读数的十进制写法一致（如 0.0000015 -> "1.5e-06"、21.6 -> "21.6"）。
+    """
+    return Decimal(str(x))
+
+
 def _better(x: _State, y: _State) -> bool:
     """配对数多者优；其次时间差总和小者；再其次配对序号序列字典序小者。"""
     return (-x.pairs, x.cost_us, x.code) < (-y.pairs, y.cost_us, y.code)
@@ -140,11 +156,13 @@ def _better(x: _State, y: _State) -> bool:
 def match_points(
     ref: List[_Point],
     target: List[_Point],
-    max_delta_us: int,
+    max_delta_us: Decimal,
 ) -> List[Tuple[int, int]]:
     """保序二分匹配主过程，返回排序后的 (ref_idx, target_idx) 配对列表。
 
     每个点最多出现一次；只允许单位相同且时间差不超过上限的对角边。
+    max_delta_us 为请求阈值换算成的微秒数（Decimal，可含小数微秒）；
+    整数微秒差与它直接比较，不做任何取整，上限不会被扩大或缩小。
     平局决胜编码把配对 (i, j) 记作 base = n*m 进制的一位数字
     （i*m + j，取值 [0, n*m)），按配对顺序拼接为整数；配对数相同时
     整数大小即配对序号序列的字典序。
@@ -235,7 +253,10 @@ def compare_devices(
     if allowed_value_diff < 0:
         raise ComparisonError("allowed_value_diff 不能为负数")
 
-    max_delta_us = round(max_time_delta_seconds * _US_PER_SECOND)
+    # 阈值按十进制表示换算为微秒（可为小数微秒），不做取整：
+    # 配对时整数微秒差与该十进制上限直接比较，上限不会被扩大
+    max_delta_us = _decimal(max_time_delta_seconds) * _US_PER_SECOND
+    allowed_diff = _decimal(allowed_value_diff)
 
     ref_points = load_points(conn, reference_device, metric, from_, to)
     if len(ref_points) > MAX_SIDE_POINTS:
@@ -262,8 +283,10 @@ def compare_devices(
         a = ref_points[ref_idx]
         b = target_points[target_idx]
         delta_us = _delta_us(a, b)
-        abs_diff = abs(a.value - b.value)
-        exceeded = abs_diff > allowed_value_diff  # 等于允许偏差不算超差
+        # 绝对差与超差判定按存储的十进制读数计算：如 21.6 - 20.0 恰为
+        # 1.6，避免二进制浮点相减的尾数误差把等于上限误判为超差
+        abs_diff = abs(_decimal(a.value) - _decimal(b.value))
+        exceeded = abs_diff > allowed_diff  # 等于允许偏差不算超差
         exceeded_count += int(exceeded)
         pairs.append(
             ComparisonPair(
@@ -271,7 +294,7 @@ def compare_devices(
                 reference=_side_point(reference_device, a),
                 target=_side_point(target_device, b),
                 time_delta_seconds=delta_us / _US_PER_SECOND,
-                abs_value_diff=abs_diff,
+                abs_value_diff=float(abs_diff),
                 exceeded=exceeded,
             )
         )
